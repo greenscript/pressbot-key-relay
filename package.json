@@ -1,0 +1,20 @@
+{
+  "name": "pressbot-key-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker that holds an AI provider key so your WordPress site never stores it.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "dry-run": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "wrangler": "^4.36.0"
+  }
+}

@@ -1,0 +1,25 @@
+name = "pressbot-key-relay"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+
+# No secrets here. Set them with:
+#   npx wrangler secret put ANTHROPIC_API_KEY
+#   npx wrangler secret put RELAY_TOKEN_HASHES
+
+[vars]
+ALLOWED_MODELS = "claude-haiku-5-5,claude-sonnet-5-5"
+MAX_TOKENS_CAP = "16000"
+# Comma-separated IPv4/IPv6 addresses (or IPv4 CIDRs) of your WordPress server. Empty = IP lock off.
+ALLOWED_IPS = ""
+# Shown by /health. Keep in sync with the [ratelimits.simple] limit below.
+RATE_LIMIT_PER_MINUTE = "60"
+
+# Rate limiting binding (needs wrangler 4.36+). period must be 10 or 60 (seconds).
+# Docs: https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
+[[ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "7301"
+
+  [ratelimits.simple]
+  limit = 60
+  period = 60
