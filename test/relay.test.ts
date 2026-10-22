@@ -261,7 +261,14 @@ describe("body hardening", () => {
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => new Response("{}", { headers: { "content-type": "application/json" } })));
     expect((await send([{ name: "x", input_schema: {} }, { type: "custom", name: "y" }])).status).toBe(200);
     expect((await send([{ type: "web_search_20250305", name: "web_search", max_uses: 5 }])).status).toBe(200);
+    // A missing max_uses must not lift the cap: the relay fills in the default before forwarding.
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockClear();
     expect((await send([{ type: "web_search_20250305", name: "web_search" }])).status).toBe(200);
+    const forwarded = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+    expect(forwarded.tools[0].max_uses).toBe(5);
+    // A non-string type is rejected, not coerced.
+    expect((await send([{ type: ["web_search_20250305"], name: "w" }])).status).toBe(400);
     const bad = await send([{ type: "bash_20250124", name: "bash" }]);
     expect(bad.status).toBe(400);
     const e = await err(bad);
@@ -297,16 +304,17 @@ describe("body hardening", () => {
     expect(r.headers.get("location")).toBeNull();
     vi.unstubAllGlobals();
   });
-  it("invalid ALLOWED_IPS fails closed for authenticated callers and /health names the entry", async () => {
+  it("invalid ALLOWED_IPS fails closed and keeps the entries out of the response", async () => {
     const bad = { ...env, ALLOWED_IPS: "203.0.113.7/" };
     const r = await handle(req("/anthropic/v1/messages", { ip: "8.8.8.8", body: body(good) }), bad);
     expect(r.status).toBe(500);
     const e = await err(r);
     expect(e.error.code).toBe("relay_misconfigured");
-    expect(e.error.message).toContain("203.0.113.7/");
+    expect(e.error.message).toContain("1 invalid entry");
+    expect(e.error.message).not.toContain("203.0.113");
     const h = await handle(req("/health", { method: "GET", ip: "8.8.8.8" }), bad);
     expect(h.status).toBe(500);
-    expect((await err(h)).error.message).toContain("203.0.113.7/");
+    expect((await err(h)).error.message).not.toContain("203.0.113");
   });
 });
 

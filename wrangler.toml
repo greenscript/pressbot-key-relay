@@ -9,7 +9,7 @@ compatibility_date = "2026-10-01"
 [vars]
 ALLOWED_MODELS = "claude-haiku-5-5,claude-sonnet-5-5"
 MAX_TOKENS_CAP = "16000"
-# Comma-separated IPv4/IPv6 addresses (or IPv4 CIDRs) of your WordPress server. Empty = IP lock off.
+# Comma-separated IPv4/IPv6 addresses (or IPv4/IPv6 CIDRs) of your WordPress server. Empty = IP lock off.
 ALLOWED_IPS = ""
 # Set to "true" to allow IPv4 CIDRs shorter than /16 or IPv6 shorter than /32. Leave unset.
 ALLOW_BROAD_CIDR = ""

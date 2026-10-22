@@ -281,13 +281,18 @@ export function validateBody(raw: string, isCount: boolean, env: Env): BodyCheck
       }
       const t = tool as Record<string, unknown>;
       if (t.type !== undefined && t.type !== "custom") {
-        const type = String(t.type);
+        if (typeof t.type !== "string") {
+          return { ok: false, response: errorResponse("tool_not_allowed", "Tool type must be a string.") };
+        }
+        const type = t.type;
         if (!serverTools.includes(type)) {
           return { ok: false, response: errorResponse("tool_not_allowed", `Tool type "${type.slice(0, 80)}" is not allowed by this relay. Allowed server tools: ${serverTools.join(", ") || "none"}.`) };
         }
         if (t.max_uses !== undefined && (typeof t.max_uses !== "number" || !(t.max_uses <= maxUses))) {
           return { ok: false, response: errorResponse("tool_not_allowed", `max_uses for ${type} must be a number no higher than ${maxUses}.`) };
         }
+        // Leaving max_uses out must not lift the cap: fill it in (the parsed body is what gets forwarded).
+        if (t.max_uses === undefined) t.max_uses = maxUses;
       }
     }
   }
@@ -380,8 +385,11 @@ export async function handle(request: Request, env: Env): Promise<Response> {
   const allowedIps = splitList(env.ALLOWED_IPS);
   const ipConfig = compileAllowedIps(allowedIps, env.ALLOW_BROAD_CIDR === "true");
   if (ipConfig.invalid.length) {
+    // Details go to the Worker logs only: the caller's IP hasn't been checked yet, and the
+    // invalid entries are likely near-copies of the server's real address.
     const list = ipConfig.invalid.map((i) => `"${i.entry}" (${i.reason})`).join("; ");
-    return logged(path, null, errorResponse("relay_misconfigured", `ALLOWED_IPS has invalid entries, so the relay refuses requests until fixed: ${list}.`));
+    console.log(JSON.stringify({ relay_config_error: "ALLOWED_IPS", invalid: list }));
+    return logged(path, null, errorResponse("relay_misconfigured", `ALLOWED_IPS has ${ipConfig.invalid.length} invalid entr${ipConfig.invalid.length === 1 ? "y" : "ies"}, so the relay refuses requests until it is fixed. Details are in the Worker logs.`));
   }
   const callerIp = request.headers.get("cf-connecting-ip") ?? "";
   const lockOn = allowedIps.length > 0;
@@ -417,10 +425,10 @@ export async function handle(request: Request, env: Env): Promise<Response> {
     return logged(path, null, res);
   }
 
+  if (!ipOk) return logged(path, null, errorResponse("ip_not_allowed", ipMessage));
   if (!env.ANTHROPIC_API_KEY) {
     return logged(path, null, errorResponse("relay_misconfigured", "No provider key is set on this relay. Set the ANTHROPIC_API_KEY secret."));
   }
-  if (!ipOk) return logged(path, null, errorResponse("ip_not_allowed", ipMessage));
 
   const raw = await readBody(request);
   if (raw instanceof Response) return logged(path, null, raw);
