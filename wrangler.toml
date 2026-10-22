@@ -11,6 +11,13 @@ ALLOWED_MODELS = "claude-haiku-5-5,claude-sonnet-5-5"
 MAX_TOKENS_CAP = "16000"
 # Comma-separated IPv4/IPv6 addresses (or IPv4 CIDRs) of your WordPress server. Empty = IP lock off.
 ALLOWED_IPS = ""
+# Set to "true" to allow IPv4 CIDRs shorter than /16 or IPv6 shorter than /32. Leave unset.
+ALLOW_BROAD_CIDR = ""
+# anthropic-beta values to forward (comma-separated). Empty = the header is dropped.
+ALLOWED_BETAS = ""
+# Server tool types a request may use. Custom tools are always allowed.
+ALLOWED_SERVER_TOOLS = "web_search_20250305,web_search_20260209"
+MAX_WEB_SEARCH_USES = "5"
 # Shown by /health. Keep in sync with the [ratelimits.simple] limit below.
 RATE_LIMIT_PER_MINUTE = "60"
 

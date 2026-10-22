@@ -10,12 +10,18 @@ export interface Env {
   ALLOWED_MODELS?: string;
   MAX_TOKENS_CAP?: string;
   RATE_LIMIT_PER_MINUTE?: string;
+  ALLOW_BROAD_CIDR?: string;
+  ALLOWED_BETAS?: string;
+  ALLOWED_SERVER_TOOLS?: string;
+  MAX_WEB_SEARCH_USES?: string;
   RATE_LIMITER?: { limit(opts: { key: string }): Promise<{ success: boolean }> };
 }
 
 export const DEFAULT_MODELS = "claude-haiku-5-5,claude-sonnet-5-5";
 export const DEFAULT_MAX_TOKENS_CAP = 16000;
 export const DEFAULT_RATE_LIMIT = 60;
+export const DEFAULT_SERVER_TOOLS = "web_search_20250305,web_search_20260209";
+export const DEFAULT_MAX_WEB_SEARCH_USES = 5;
 export const MAX_BODY_BYTES = 2 * 1024 * 1024;
 
 const UPSTREAM = {
@@ -27,14 +33,14 @@ const FORWARD_REQUEST_HEADERS = ["anthropic-version", "anthropic-beta", "content
 const PASS_RESPONSE_HEADERS = ["content-type", "request-id"];
 
 export type RelayCode =
-  | "token_missing" | "token_invalid" | "ip_not_allowed" | "model_not_allowed"
+  | "token_missing" | "token_invalid" | "tool_not_allowed" | "ip_not_allowed" | "model_not_allowed"
   | "max_tokens_exceeded" | "bad_request" | "rate_limited" | "not_found"
   | "method_not_allowed" | "relay_misconfigured" | "upstream_unreachable";
 
 const STATUS: Record<RelayCode, number> = {
   token_missing: 401, token_invalid: 401, ip_not_allowed: 403, model_not_allowed: 400,
   max_tokens_exceeded: 400, bad_request: 400, rate_limited: 429, not_found: 404,
-  method_not_allowed: 405, relay_misconfigured: 500, upstream_unreachable: 502,
+  method_not_allowed: 405, tool_not_allowed: 400, relay_misconfigured: 500, upstream_unreachable: 502,
 };
 
 export function errorResponse(code: RelayCode, message: string, extra: Record<string, string> = {}): Response {
@@ -56,6 +62,11 @@ export function allowedModels(env: Env): string[] {
 export function maxTokensCap(env: Env): number {
   const n = Number(env.MAX_TOKENS_CAP);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_MAX_TOKENS_CAP;
+}
+
+export function maxWebSearchUses(env: Env): number {
+  const n = Number(env.MAX_WEB_SEARCH_USES);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_MAX_WEB_SEARCH_USES;
 }
 
 export function rateLimitPerMinute(env: Env): number {
@@ -93,41 +104,127 @@ export async function matchToken(token: string, hashes: string[]): Promise<strin
   return found;
 }
 
-function ipv4ToInt(ip: string): number | null {
+type ParsedIp = { v: 4 | 6; b: number[] };
+type AllowedEntry = { v: 4 | 6; b: number[]; bits: number };
+
+function parseV4(ip: string): number[] | null {
   const parts = ip.split(".");
   if (parts.length !== 4) return null;
-  let n = 0;
+  const out: number[] = [];
   for (const p of parts) {
     if (!/^\d{1,3}$/.test(p) || Number(p) > 255) return null;
-    n = n * 256 + Number(p);
+    out.push(Number(p));
   }
-  return n;
+  return out;
 }
 
-export function ipAllowed(ip: string, allowed: string[]): boolean {
+function parseV6(ip: string): number[] | null {
+  if (!/^[0-9a-f:.]+$/i.test(ip)) return null; // also rejects zone ids (%eth0)
+  let s = ip.toLowerCase();
+  // Embedded IPv4 tail (::ffff:1.2.3.4) becomes two hextets.
+  const lastColon = s.lastIndexOf(":");
+  if (s.includes(".")) {
+    const v4 = parseV4(s.slice(lastColon + 1));
+    if (!v4) return null;
+    s = s.slice(0, lastColon + 1) + ((v4[0] << 8) | v4[1]).toString(16) + ":" + ((v4[2] << 8) | v4[3]).toString(16);
+  }
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const toGroups = (h: string) => (h === "" ? [] : h.split(":"));
+  const head = toGroups(halves[0]);
+  const tail = halves.length === 2 ? toGroups(halves[1]) : [];
+  let groups: string[];
+  if (halves.length === 2) {
+    const missing = 8 - head.length - tail.length;
+    if (missing < 1) return null;
+    groups = [...head, ...Array(missing).fill("0"), ...tail];
+  } else {
+    groups = head;
+  }
+  if (groups.length !== 8) return null;
+  const out: number[] = [];
+  for (const g of groups) {
+    if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
+    const n = parseInt(g, 16);
+    out.push(n >> 8, n & 255);
+  }
+  return out;
+}
+
+/** Parses an IPv4 or IPv6 address. IPv4-mapped IPv6 (::ffff:a.b.c.d) is returned as IPv4. */
+export function parseIp(ip: string): ParsedIp | null {
+  const t = ip.trim();
+  if (t.includes(":")) {
+    const b = parseV6(t);
+    if (!b) return null;
+    const mapped = b.slice(0, 10).every((x) => x === 0) && b[10] === 255 && b[11] === 255;
+    return mapped ? { v: 4, b: b.slice(12) } : { v: 6, b };
+  }
+  const b = parseV4(t);
+  return b ? { v: 4, b } : null;
+}
+
+/** Parses one ALLOWED_IPS entry. Returns an error string for anything malformed or too broad. */
+export function parseAllowedEntry(entry: string, allowBroad: boolean): AllowedEntry | string {
+  const slash = entry.indexOf("/");
+  const addr = slash === -1 ? entry : entry.slice(0, slash);
+  const ip = parseIp(addr);
+  if (!ip) return "not a valid IP address";
+  const isMappedV6 = addr.includes(":") && ip.v === 4;
+  if (slash === -1) return { v: ip.v, b: ip.b, bits: ip.v === 4 ? 32 : 128 };
+  const bitsStr = entry.slice(slash + 1);
+  if (!/^\d{1,3}$/.test(bitsStr)) return "prefix length must be a number";
+  const bits = Number(bitsStr);
+  if (isMappedV6) return "use a plain IPv4 CIDR instead of an IPv4-mapped IPv6 CIDR";
+  const max = ip.v === 4 ? 32 : 128;
+  if (bits > max) return `prefix length must be at most ${max}`;
+  const minSafe = ip.v === 4 ? 16 : 32;
+  if (bits < minSafe && !allowBroad) {
+    return `/${bits} is very broad (smaller than /${minSafe}); set ALLOW_BROAD_CIDR="true" if you really mean it`;
+  }
+  return { v: ip.v, b: ip.b, bits };
+}
+
+function prefixMatch(a: number[], b: number[], bits: number): boolean {
+  for (let i = 0; i < a.length && bits > 0; i++, bits -= 8) {
+    const mask = bits >= 8 ? 0xff : (0xff << (8 - bits)) & 0xff;
+    if ((a[i] & mask) !== (b[i] & mask)) return false;
+  }
+  return true;
+}
+
+/** Checks ALLOWED_IPS. Returns the parsed entries and the malformed ones (config errors). */
+export function compileAllowedIps(list: string[], allowBroad: boolean): { entries: AllowedEntry[]; invalid: { entry: string; reason: string }[] } {
+  const entries: AllowedEntry[] = [];
+  const invalid: { entry: string; reason: string }[] = [];
+  for (const e of list) {
+    const r = parseAllowedEntry(e, allowBroad);
+    if (typeof r === "string") invalid.push({ entry: e, reason: r });
+    else entries.push(r);
+  }
+  return { entries, invalid };
+}
+
+/** Empty list = lock off = allowed. Malformed entries never match (fail closed). */
+export function ipAllowed(ip: string, allowed: string[], allowBroad = false): boolean {
   if (!allowed.length) return true;
-  const normalized = ip.toLowerCase();
-  for (const entry of allowed) {
-    if (entry.includes("/")) {
-      const [base, bitsStr] = entry.split("/");
-      const bits = Number(bitsStr);
-      const a = ipv4ToInt(ip);
-      const b = ipv4ToInt(base);
-      if (a === null || b === null || !Number.isInteger(bits) || bits < 0 || bits > 32) continue;
-      const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
-      if (((a & mask) >>> 0) === ((b & mask) >>> 0)) return true;
-    } else if (entry.toLowerCase() === normalized) {
-      return true;
-    }
-  }
-  return false;
+  const caller = parseIp(ip);
+  if (!caller) return false;
+  return compileAllowedIps(allowed, allowBroad).entries.some((e) => e.v === caller.v && prefixMatch(caller.b, e.b, e.bits));
 }
 
-export function filterRequestHeaders(inbound: Headers, apiKey: string): Headers {
+export function filterRequestHeaders(inbound: Headers, apiKey: string, allowedBetas: string[] = []): Headers {
   const out = new Headers();
   for (const name of FORWARD_REQUEST_HEADERS) {
     const v = inbound.get(name);
-    if (v !== null) out.set(name, v);
+    if (v === null) continue;
+    if (name === "anthropic-beta") {
+      // Beta features can change what a request does: forward only the ones the owner listed.
+      const kept = v.split(",").map((x) => x.trim()).filter((x) => allowedBetas.includes(x));
+      if (kept.length) out.set(name, kept.join(","));
+      continue;
+    }
+    out.set(name, v);
   }
   out.set("x-api-key", apiKey);
   return out;
@@ -167,6 +264,33 @@ export function validateBody(raw: string, isCount: boolean, env: Env): BodyCheck
       response: errorResponse("model_not_allowed", `Model "${obj.model}" is not allowed by this relay. Allowed models: ${models.join(", ")}.`),
     };
   }
+  for (const key of ["mcp_servers", "container"]) {
+    if (key in obj) {
+      return { ok: false, response: errorResponse("bad_request", `"${key}" is not allowed by this relay.`) };
+    }
+  }
+  if (obj.tools !== undefined) {
+    if (!Array.isArray(obj.tools)) {
+      return { ok: false, response: errorResponse("bad_request", "tools must be an array.") };
+    }
+    const serverTools = splitList(env.ALLOWED_SERVER_TOOLS ?? DEFAULT_SERVER_TOOLS);
+    const maxUses = maxWebSearchUses(env);
+    for (const tool of obj.tools) {
+      if (!tool || typeof tool !== "object" || Array.isArray(tool)) {
+        return { ok: false, response: errorResponse("bad_request", "Each tool must be an object.") };
+      }
+      const t = tool as Record<string, unknown>;
+      if (t.type !== undefined && t.type !== "custom") {
+        const type = String(t.type);
+        if (!serverTools.includes(type)) {
+          return { ok: false, response: errorResponse("tool_not_allowed", `Tool type "${type.slice(0, 80)}" is not allowed by this relay. Allowed server tools: ${serverTools.join(", ") || "none"}.`) };
+        }
+        if (t.max_uses !== undefined && (typeof t.max_uses !== "number" || !(t.max_uses <= maxUses))) {
+          return { ok: false, response: errorResponse("tool_not_allowed", `max_uses for ${type} must be a number no higher than ${maxUses}.`) };
+        }
+      }
+    }
+  }
   const cap = maxTokensCap(env);
   if (obj.max_tokens === undefined || obj.max_tokens === null) {
     if (!isCount) {
@@ -180,7 +304,9 @@ export function validateBody(raw: string, isCount: boolean, env: Env): BodyCheck
       response: errorResponse("max_tokens_exceeded", `max_tokens ${obj.max_tokens} is above this relay's cap of ${cap}.`),
     };
   }
-  return { ok: true, model: obj.model, body: raw };
+  // Forward exactly what was validated. Forwarding the raw text would let duplicate JSON keys
+  // ("model" twice) show the relay one value and Anthropic another.
+  return { ok: true, model: obj.model, body: JSON.stringify(obj) };
 }
 
 function log(path: string, model: string | null, status: number, usage?: { in?: number; out?: number }): void {
@@ -196,16 +322,30 @@ function logged(path: string, model: string | null, res: Response): Response {
   return res;
 }
 
-async function readBody(request: Request): Promise<string | Response> {
+const TOO_BIG = () => errorResponse("bad_request", `Request body is larger than the ${MAX_BODY_BYTES / 1024 / 1024} MB limit.`);
+
+/** Reads the body with a running byte count and stops as soon as the limit is passed. */
+export async function readBody(request: Request): Promise<string | Response> {
   const declared = Number(request.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
-    return errorResponse("bad_request", `Request body is larger than the ${MAX_BODY_BYTES / 1024 / 1024} MB limit.`);
+  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) return TOO_BIG();
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BODY_BYTES) {
+      await reader.cancel().catch(() => {});
+      return TOO_BIG();
+    }
+    chunks.push(value);
   }
-  const buf = await request.arrayBuffer();
-  if (buf.byteLength > MAX_BODY_BYTES) {
-    return errorResponse("bad_request", `Request body is larger than the ${MAX_BODY_BYTES / 1024 / 1024} MB limit.`);
-  }
-  return new TextDecoder().decode(buf);
+  const all = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { all.set(c, off); off += c.byteLength; }
+  return new TextDecoder().decode(all);
 }
 
 export async function handle(request: Request, env: Env): Promise<Response> {
@@ -222,14 +362,11 @@ export async function handle(request: Request, env: Env): Promise<Response> {
     return logged(path, null, errorResponse("method_not_allowed", `Use ${wantedMethod} for this path.`, { allow: wantedMethod }));
   }
 
+  // Auth first: unauthenticated callers must not learn what is or is not configured.
   const hashes = splitList(env.RELAY_TOKEN_HASHES);
   if (!hashes.length) {
-    return logged(path, null, errorResponse("relay_misconfigured", "No token hashes are set on this relay. Set the RELAY_TOKEN_HASHES secret."));
+    return logged(path, null, errorResponse("token_invalid", "The relay token is not valid. It may have been revoked."));
   }
-  if (!isHealth && !env.ANTHROPIC_API_KEY) {
-    return logged(path, null, errorResponse("relay_misconfigured", "No provider key is set on this relay. Set the ANTHROPIC_API_KEY secret."));
-  }
-
   const token = bearerToken(request);
   if (!token) {
     return logged(path, null, errorResponse("token_missing", "Missing relay token. Send an Authorization: Bearer header."));
@@ -239,28 +376,51 @@ export async function handle(request: Request, env: Env): Promise<Response> {
     return logged(path, null, errorResponse("token_invalid", "The relay token is not valid. It may have been revoked."));
   }
 
+  // Authenticated from here on, so configuration problems can be reported.
+  const allowedIps = splitList(env.ALLOWED_IPS);
+  const ipConfig = compileAllowedIps(allowedIps, env.ALLOW_BROAD_CIDR === "true");
+  if (ipConfig.invalid.length) {
+    const list = ipConfig.invalid.map((i) => `"${i.entry}" (${i.reason})`).join("; ");
+    return logged(path, null, errorResponse("relay_misconfigured", `ALLOWED_IPS has invalid entries, so the relay refuses requests until fixed: ${list}.`));
+  }
   const callerIp = request.headers.get("cf-connecting-ip") ?? "";
+  const lockOn = allowedIps.length > 0;
+  const ipOk = !lockOn || ipAllowed(callerIp, allowedIps, env.ALLOW_BROAD_CIDR === "true");
+  const ipMessage = `Requests from ${callerIp || "an unknown IP"} are not allowed by this relay. Add this address to ALLOWED_IPS if it is your server.`;
 
   if (isHealth) {
-    const allowedIps = splitList(env.ALLOWED_IPS);
+    if (!ipOk) {
+      const res = new Response(JSON.stringify({
+        ok: false, your_ip: callerIp, ip_lock: true,
+        error: { type: "relay_error", code: "ip_not_allowed", message: ipMessage },
+      }), { status: 403, headers: { "content-type": "application/json" } });
+      return logged(path, null, res);
+    }
+    const warnings: string[] = [];
+    if (!lockOn) warnings.push("ip_lock_off");
+    if (!env.RATE_LIMITER) warnings.push("rate_limit_off");
+    if (!env.ANTHROPIC_API_KEY) warnings.push("provider_key_missing");
     const res = new Response(JSON.stringify({
       ok: true,
       relay: "pressbot-key-relay",
       version: pkg.version,
       providers: ["anthropic"],
       allowed_models: allowedModels(env),
+      allowed_server_tools: splitList(env.ALLOWED_SERVER_TOOLS ?? DEFAULT_SERVER_TOOLS),
+      allowed_betas: splitList(env.ALLOWED_BETAS),
       max_tokens_cap: maxTokensCap(env),
-      ip_lock: allowedIps.length > 0,
+      ip_lock: lockOn,
       your_ip: callerIp,
       rate_limit_per_minute: rateLimitPerMinute(env),
+      warnings,
     }), { status: 200, headers: { "content-type": "application/json" } });
     return logged(path, null, res);
   }
 
-  const allowedIps = splitList(env.ALLOWED_IPS);
-  if (allowedIps.length && !ipAllowed(callerIp, allowedIps)) {
-    return logged(path, null, errorResponse("ip_not_allowed", `Requests from ${callerIp || "an unknown IP"} are not allowed by this relay. Add this address to ALLOWED_IPS if it is your server.`));
+  if (!env.ANTHROPIC_API_KEY) {
+    return logged(path, null, errorResponse("relay_misconfigured", "No provider key is set on this relay. Set the ANTHROPIC_API_KEY secret."));
   }
+  if (!ipOk) return logged(path, null, errorResponse("ip_not_allowed", ipMessage));
 
   const raw = await readBody(request);
   if (raw instanceof Response) return logged(path, null, raw);
@@ -279,11 +439,17 @@ export async function handle(request: Request, env: Env): Promise<Response> {
   try {
     upstream = await fetch(upstreamUrl, {
       method: "POST",
-      headers: filterRequestHeaders(request.headers, env.ANTHROPIC_API_KEY as string),
+      headers: filterRequestHeaders(request.headers, env.ANTHROPIC_API_KEY as string, splitList(env.ALLOWED_BETAS)),
       body: checked.body,
+      redirect: "manual", // never follow: a redirect could carry the key to another host
     });
   } catch {
     return logged(path, checked.model, errorResponse("upstream_unreachable", "The relay could not reach api.anthropic.com."));
+  }
+
+  if (upstream.status >= 300 && upstream.status < 400) {
+    await upstream.body?.cancel().catch(() => {});
+    return logged(path, checked.model, errorResponse("upstream_unreachable", "Anthropic answered with a redirect, which the relay does not follow."));
   }
 
   const headers = filterResponseHeaders(upstream.headers);

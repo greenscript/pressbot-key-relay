@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   handle, sha256Hex, ipAllowed, filterRequestHeaders, filterResponseHeaders,
-  timingSafeEqual, validateBody, type Env,
+  timingSafeEqual, validateBody, parseIp, compileAllowedIps, readBody, type Env,
 } from "../src/index";
 
 const TOKEN = "pbr_testtoken";
@@ -45,9 +45,47 @@ describe("pure helpers", () => {
     const h = filterRequestHeaders(new Headers({
       authorization: "Bearer x", cookie: "c", "x-api-key": "evil", "anthropic-version": "2023-06-01",
       "anthropic-beta": "b", "content-type": "application/json", accept: "text/event-stream", "user-agent": "u",
-    }), "KEY");
+    }), "KEY", ["b"]);
     expect([...h.keys()].sort()).toEqual(["accept", "anthropic-beta", "anthropic-version", "content-type", "x-api-key"]);
     expect(h.get("x-api-key")).toBe("KEY");
+  });
+  it("drops anthropic-beta unless allowed", () => {
+    const inb = new Headers({ "anthropic-beta": "a-1, b-2" });
+    expect(filterRequestHeaders(inb, "K").get("anthropic-beta")).toBeNull();
+    expect(filterRequestHeaders(inb, "K", ["b-2"]).get("anthropic-beta")).toBe("b-2");
+  });
+  it("CIDR with empty or malformed prefix is rejected, not /0", () => {
+    expect(ipAllowed("8.8.8.8", ["203.0.113.7/"])).toBe(false);
+    expect(ipAllowed("8.8.8.8", ["203.0.113.7/ "])).toBe(false);
+    expect(ipAllowed("8.8.8.8", ["203.0.113.7/abc"])).toBe(false);
+    expect(ipAllowed("8.8.8.8", ["203.0.113.7/33"])).toBe(false);
+    expect(compileAllowedIps(["203.0.113.7/"], false).invalid).toHaveLength(1);
+    expect(compileAllowedIps(["2001:db8::/129"], false).invalid).toHaveLength(1);
+  });
+  it("broad CIDRs need ALLOW_BROAD_CIDR", () => {
+    expect(compileAllowedIps(["10.0.0.0/8"], false).invalid).toHaveLength(1);
+    expect(compileAllowedIps(["10.0.0.0/8"], true).invalid).toHaveLength(0);
+    expect(compileAllowedIps(["2001:db8::/16"], false).invalid).toHaveLength(1);
+    expect(compileAllowedIps(["2001:db8::/32"], false).invalid).toHaveLength(0);
+    expect(ipAllowed("10.9.9.9", ["10.0.0.0/8"], true)).toBe(true);
+  });
+  it("normalizes IPv6 and maps IPv4-mapped addresses", () => {
+    expect(parseIp("2001:0DB8:0:0:0:0:0:0001")).toEqual(parseIp("2001:db8::1"));
+    expect(parseIp("::ffff:203.0.113.7")).toEqual({ v: 4, b: [203, 0, 113, 7] });
+    expect(parseIp("::ffff:cb00:7107")).toEqual({ v: 4, b: [203, 0, 113, 7] });
+    expect(parseIp("fe80::1%eth0")).toBeNull();
+    expect(parseIp("1::2::3")).toBeNull();
+    expect(ipAllowed("::ffff:203.0.113.7", ["203.0.113.7"])).toBe(true);
+    expect(ipAllowed("203.0.113.7", ["::ffff:203.0.113.7"])).toBe(true);
+    expect(ipAllowed("2001:db8:0:0:0:0:0:1", ["2001:DB8::1"])).toBe(true);
+    expect(ipAllowed("2001:db8::2", ["2001:DB8::1"])).toBe(false);
+  });
+  it("IPv6 CIDR", () => {
+    expect(ipAllowed("2001:db8:abcd::5", ["2001:db8::/32"])).toBe(true);
+    expect(ipAllowed("2001:db9::5", ["2001:db8::/32"])).toBe(false);
+    expect(ipAllowed("2001:db8:1:2::9", ["2001:db8:1:2::/64"])).toBe(true);
+    expect(ipAllowed("2001:db8:1:3::9", ["2001:db8:1:2::/64"])).toBe(false);
+    expect(ipAllowed("10.1.2.3", ["2001:db8::/32"])).toBe(false);
   });
   it("filters response headers", () => {
     const h = filterResponseHeaders(new Headers({
@@ -77,7 +115,18 @@ describe("request flow", () => {
     expect(r.status).toBe(500);
     expect((await err(r)).error.code).toBe("relay_misconfigured");
     const r2 = await handle(req("/anthropic/v1/messages", { body: body(good) }), { ...env, RELAY_TOKEN_HASHES: "" });
-    expect(r2.status).toBe(500);
+    // Empty hash list: even unauthenticated callers just see token_invalid.
+    expect(r2.status).toBe(401);
+    expect((await err(r2)).error.code).toBe("token_invalid");
+  });
+  it("auth comes before config errors", async () => {
+    const noKey = { ...env, ANTHROPIC_API_KEY: "" };
+    const a = await handle(req("/anthropic/v1/messages", { token: null, body: body(good) }), noKey);
+    expect((await err(a)).error.code).toBe("token_missing");
+    const b = await handle(req("/anthropic/v1/messages", { token: "bad", body: body(good) }), noKey);
+    expect((await err(b)).error.code).toBe("token_invalid");
+    const c = await handle(req("/anthropic/v1/messages", { token: null, body: body(good) }), { ...env, ALLOWED_IPS: "nonsense" });
+    expect((await err(c)).error.code).toBe("token_missing");
   });
   it("token missing / invalid", async () => {
     const a = await handle(req("/anthropic/v1/messages", { token: null, body: body(good) }), env);
@@ -183,11 +232,106 @@ describe("request flow", () => {
   });
 });
 
+describe("body hardening", () => {
+  it("forwards the validated JSON, so duplicate keys cannot smuggle values", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("{}", { headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const raw = '{"model":"claude-opus-5","max_tokens":999999,"model":"claude-haiku-5-5","max_tokens":10,"messages":[]}';
+    // JSON.parse keeps the last value, so this passes validation as haiku/10...
+    const r = await handle(req("/anthropic/v1/messages", { body: raw }), env);
+    expect(r.status).toBe(200);
+    const sent = fetchMock.mock.calls[0][1].body as string;
+    expect(sent).not.toContain("opus");
+    expect(sent).not.toContain("999999");
+    expect(JSON.parse(sent)).toMatchObject({ model: "claude-haiku-5-5", max_tokens: 10 });
+    // ...and the reverse order is rejected on the value the relay actually sees.
+    const r2 = await handle(req("/anthropic/v1/messages", { body: '{"model":"claude-haiku-5-5","model":"claude-opus-5","max_tokens":1}' }), env);
+    expect(r2.status).toBe(400);
+    vi.unstubAllGlobals();
+  });
+  it("rejects mcp_servers and container", async () => {
+    for (const k of ["mcp_servers", "container"]) {
+      const r = await handle(req("/anthropic/v1/messages", { body: body({ ...good, [k]: [] }) }), env);
+      expect(r.status).toBe(400);
+      expect((await err(r)).error.message).toContain(k);
+    }
+  });
+  it("tool allowlist", async () => {
+    const send = (tools: unknown[], e: Env = env) => handle(req("/anthropic/v1/messages", { body: body({ ...good, tools }) }), e);
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => new Response("{}", { headers: { "content-type": "application/json" } })));
+    expect((await send([{ name: "x", input_schema: {} }, { type: "custom", name: "y" }])).status).toBe(200);
+    expect((await send([{ type: "web_search_20250305", name: "web_search", max_uses: 5 }])).status).toBe(200);
+    expect((await send([{ type: "web_search_20250305", name: "web_search" }])).status).toBe(200);
+    const bad = await send([{ type: "bash_20250124", name: "bash" }]);
+    expect(bad.status).toBe(400);
+    const e = await err(bad);
+    expect(e.error.code).toBe("tool_not_allowed");
+    expect(e.error.message).toContain("bash_20250124");
+    expect((await send([{ type: "web_search_20250305", name: "w", max_uses: 6 }])).status).toBe(400);
+    expect((await send([{ type: "web_search_20250305", name: "w", max_uses: "5" }])).status).toBe(400);
+    expect((await send([{ type: "web_search_20250305", name: "w" }], { ...env, ALLOWED_SERVER_TOOLS: "x" })).status).toBe(400);
+    vi.unstubAllGlobals();
+  });
+  it("enforces the size limit while streaming, cancelling early", async () => {
+    let pulled = 0;
+    let cancelled = false;
+    const chunk = new Uint8Array(512 * 1024);
+    const stream = new ReadableStream<Uint8Array>({
+      pull(c) { pulled++; c.enqueue(chunk); if (pulled > 100) c.close(); },
+      cancel() { cancelled = true; },
+    });
+    const r = new Request("https://relay.test/x", { method: "POST", body: stream, duplex: "half" } as RequestInit);
+    const out = await readBody(r);
+    expect(out).toBeInstanceOf(Response);
+    expect((out as Response).status).toBe(400);
+    expect(cancelled).toBe(true);
+    expect(pulled).toBeLessThan(20);
+  });
+  it("does not follow redirects", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 307, headers: { location: "https://evil.test/" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const r = await handle(req("/anthropic/v1/messages", { body: body(good) }), env);
+    expect(fetchMock.mock.calls[0][1].redirect).toBe("manual");
+    expect(r.status).toBe(502);
+    expect((await err(r)).error.code).toBe("upstream_unreachable");
+    expect(r.headers.get("location")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+  it("invalid ALLOWED_IPS fails closed for authenticated callers and /health names the entry", async () => {
+    const bad = { ...env, ALLOWED_IPS: "203.0.113.7/" };
+    const r = await handle(req("/anthropic/v1/messages", { ip: "8.8.8.8", body: body(good) }), bad);
+    expect(r.status).toBe(500);
+    const e = await err(r);
+    expect(e.error.code).toBe("relay_misconfigured");
+    expect(e.error.message).toContain("203.0.113.7/");
+    const h = await handle(req("/health", { method: "GET", ip: "8.8.8.8" }), bad);
+    expect(h.status).toBe(500);
+    expect((await err(h)).error.message).toContain("203.0.113.7/");
+  });
+});
+
 describe("/health", () => {
+  it("is minimal when the lock is on and the caller is not allowed", async () => {
+    const r = await handle(req("/health", { method: "GET", ip: "9.9.9.9" }), { ...env, ALLOWED_IPS: "1.1.1.1" });
+    expect(r.status).toBe(403);
+    const j = await err(r);
+    expect(j).toMatchObject({ ok: false, your_ip: "9.9.9.9", ip_lock: true });
+    expect(j.error.code).toBe("ip_not_allowed");
+    expect(j.allowed_models).toBeUndefined();
+  });
+  it("full payload for an allowed IP, with warnings", async () => {
+    const r = await handle(req("/health", { method: "GET", ip: "1.1.1.1" }), { ...env, ALLOWED_IPS: "1.1.1.1" });
+    const j = await err(r);
+    expect(j.warnings).toEqual(["rate_limit_off"]);
+    expect(j.allowed_server_tools).toEqual(["web_search_20250305", "web_search_20260209"]);
+    expect(j.allowed_betas).toEqual([]);
+    const off = await err(await handle(req("/health", { method: "GET", ip: "1.1.1.1" }), env));
+    expect(off.warnings).toContain("ip_lock_off");
+  });
   it("reports config without secrets and never calls upstream", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
-    const r = await handle(req("/health", { method: "GET", ip: "5.6.7.8" }), { ...env, ALLOWED_IPS: "1.1.1.1" });
+    const r = await handle(req("/health", { method: "GET", ip: "5.6.7.8" }), { ...env, ALLOWED_IPS: "5.6.7.8" });
     expect(r.status).toBe(200);
     const text = await r.text();
     const j = JSON.parse(text);
